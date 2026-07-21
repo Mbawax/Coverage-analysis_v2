@@ -1,249 +1,431 @@
-"""
-Settlement Coverage Analysis
------------------------------
-A Streamlit port of the KNIME workflow 'Coverage_Analysis_v2.1'.
-
-Pipeline (mirrors the KNIME nodes):
- 1. Load CSV (QGIS settlement-extent export)               -> CSV Reader
- 2. Flag each grid point as Visited (1) / Not Visited (0)   -> Rule Engine
- 3. Group by LGA / Ward / Settlement, sum & count visits    -> GroupBy
- 4. Compute % of Visitation per settlement                  -> Math Formula
- 5. Classify into coverage buckets                          -> Rule Engine
- 6. Pivot: count of settlements per LGA x Coverage bucket    -> Pivot
- 7. Filter out Not Visited / Low Coverage settlements        -> Rule-based Row Filter
- 8. Let the user download each result as .xlsx               -> Excel Writer
-"""
-
-import io
-import numpy as np
+from fastapi import FastAPI, File, Form, UploadFile
+from fastapi.responses import HTMLResponse, Response
 import pandas as pd
-import streamlit as st
 
-st.set_page_config(page_title="Settlement Coverage Analysis", layout="wide")
+from analysis import guess_column, run_analysis, to_excel_bytes
 
-COVERAGE_ORDER = ["Not Visited", "Low Coverage", "Partially Covered", "Fully Covered"]
-COVERAGE_COLORS = {
-    "Not Visited": "#d62728",
-    "Low Coverage": "#ff7f0e",
-    "Partially Covered": "#f1c40f",
-    "Fully Covered": "#2ca02c",
-}
+app = FastAPI(title="Settlement Coverage Analysis")
 
 
-def classify_coverage(pct: float) -> str:
-    """Same thresholds as the KNIME 'Coverage Analysis' Rule Engine node."""
-    if pd.isna(pct):
-        return "Not Visited"
-    if pct == 0:
-        return "Not Visited"
-    if pct <= 49:
-        return "Low Coverage"
-    if pct <= 79:
-        return "Partially Covered"
-    return "Fully Covered"
+@app.get("/", response_class=HTMLResponse)
+def home() -> str:
+    return INDEX_HTML
 
 
-def to_excel_bytes(df: pd.DataFrame, sheet_name: str = "Sheet1") -> bytes:
-    buffer = io.BytesIO()
-    with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet_name)
-    return buffer.getvalue()
+@app.post("/api/preview")
+async def preview(file: UploadFile = File(...)) -> dict:
+    raw_df = pd.read_csv(file.file)
+    columns = raw_df.columns.tolist()
+    return {
+        "row_count": len(raw_df),
+        "column_count": len(raw_df.columns),
+        "columns": columns,
+        "defaults": {
+            "lga_col": guess_column(columns, ["lga_name", "grid_lga", "LGA"]),
+            "ward_col": guess_column(columns, ["ward_name", "grid_ward", "Ward"]),
+            "settlement_col": guess_column(
+                columns, ["settlement_name", "grid_settlement", "Settlement"]
+            ),
+            "visitation_col": guess_column(columns, ["visitation", "visit_status"]),
+            "points_col": guess_column(columns, ["NUMPOINTS", "building_count"]),
+        },
+        "preview": raw_df.head(50).where(pd.notna(raw_df.head(50)), None).to_dict(
+            orient="records"
+        ),
+    }
 
 
-def guess_column(columns, candidates):
-    for c in candidates:
-        if c in columns:
-            return c
-    return columns[0]
-
-
-# ---------------------------------------------------------------- Header ---
-st.title("📍 Settlement Coverage Analysis")
-st.caption(
-    "Python / Streamlit rebuild of the KNIME workflow **Coverage_Analysis_v2.1**"
-)
-
-with st.expander("ℹ️ What this app does / how it maps to the KNIME workflow"):
-    st.markdown(
-        """
-This app filters settlement visitation records and calculates the number of
-**Visited** vs **Not Visited** points per settlement. It then works out the
-**% of Visitation** for each settlement and classifies it as:
-
-- **Not Visited** — 0% visited
-- **Low Coverage** — 1–49% visited
-- **Partially Covered** — 50–79% visited
-- **Fully Covered** — ≥ 80% visited
-
-It then summarizes coverage by **LGA** (a pivot table) and produces a
-follow-up list of settlements that are **Not Visited** or **Low Coverage**.
-
-**Note on the original KNIME file:** the KNIME pivot branch (`GroupBy` →
-`Pivot` → `Missing Value`) referenced column names (`lga`, `settlement`,
-`LGA`) that didn't exist in the CSV Reader's output (`lga_name`,
-`settlement_name`) — those nodes were never actually executed in the saved
-workflow (their KNIME state was `IDLE`/`CONFIGURED`, not `EXECUTED`). This
-app fixes that mismatch and uses the real column names, so the LGA pivot
-here is a corrected, working version of what the workflow intended.
-The "TimeSpent"/"number of mins" nodes in the original workflow were also
-mislabeled leftovers (the "number of mins" column was actually a sum of
-`NUMPOINTS`, not time) and don't feed into coverage at all, so they're
-omitted here.
-        """
+@app.post("/api/analyze")
+async def analyze(
+    file: UploadFile = File(...),
+    lga_col: str = Form(...),
+    ward_col: str = Form(...),
+    settlement_col: str = Form(...),
+    visitation_col: str = Form(...),
+    points_col: str = Form(...),
+    visited_label: str = Form("Visited"),
+    not_visited_label: str = Form("Not Visited"),
+) -> dict:
+    raw_df = pd.read_csv(file.file)
+    return run_analysis(
+        raw_df,
+        lga_col=lga_col,
+        ward_col=ward_col,
+        settlement_col=settlement_col,
+        visitation_col=visitation_col,
+        points_col=points_col,
+        visited_label=visited_label,
+        not_visited_label=not_visited_label,
     )
 
-# ------------------------------------------------------------- File input --
-uploaded_file = st.file_uploader(
-    "Upload the settlement visitation CSV (QGIS export)", type=["csv"]
-)
 
-if uploaded_file is None:
-    st.info("👆 Upload a CSV to get started. Expected columns include something "
-             "like `lga_name`, `ward_name`, `settlement_name`, `visitation`, "
-             "and a points column (e.g. `NUMPOINTS`).")
-    st.stop()
+@app.post("/api/download")
+async def download(
+    records: str = Form(...),
+    sheet_name: str = Form("Sheet1"),
+    file_name: str = Form("export.xlsx"),
+) -> Response:
+    import json
 
-
-@st.cache_data(show_spinner=False)
-def load_csv(file) -> pd.DataFrame:
-    return pd.read_csv(file)
-
-
-raw_df = load_csv(uploaded_file)
-st.success(f"Loaded {len(raw_df):,} rows and {len(raw_df.columns)} columns.")
-
-with st.expander("Preview raw data"):
-    st.dataframe(raw_df.head(50), width="stretch")
-
-# --------------------------------------------------------- Column mapping --
-st.sidebar.header("Column mapping")
-st.sidebar.caption("Match your CSV's columns to what the analysis needs.")
-cols = raw_df.columns.tolist()
-
-lga_col = st.sidebar.selectbox(
-    "LGA column", cols, index=cols.index(guess_column(cols, ["lga_name", "grid_lga", "LGA"]))
-)
-ward_col = st.sidebar.selectbox(
-    "Ward column", cols, index=cols.index(guess_column(cols, ["ward_name", "grid_ward", "Ward"]))
-)
-settlement_col = st.sidebar.selectbox(
-    "Settlement column",
-    cols,
-    index=cols.index(guess_column(cols, ["settlement_name", "grid_settlement", "Settlement"])),
-)
-visitation_col = st.sidebar.selectbox(
-    "Visitation status column",
-    cols,
-    index=cols.index(guess_column(cols, ["visitation", "visit_status"])),
-)
-points_col = st.sidebar.selectbox(
-    "Points / building count column (summed per settlement)",
-    cols,
-    index=cols.index(guess_column(cols, ["NUMPOINTS", "building_count"])),
-)
-
-visited_label = st.sidebar.text_input("Value meaning 'Visited'", "Visited")
-not_visited_label = st.sidebar.text_input("Value meaning 'Not Visited'", "Not Visited")
-
-# --------------------------------------------------- Step 1: Visited flag --
-df = raw_df.copy()
-status = df[visitation_col].astype(str).str.strip()
-df["Visited_flag"] = np.select(
-    [status.str.lower() == visited_label.strip().lower(),
-     status.str.lower() == not_visited_label.strip().lower()],
-    [1, 0],
-    default=np.nan,
-)
-
-unmatched = int(df["Visited_flag"].isna().sum())
-if unmatched:
-    st.warning(
-        f"{unmatched:,} rows had a visitation value that didn't match "
-        f"'{visited_label}' or '{not_visited_label}' and were excluded from counts."
+    df = pd.DataFrame(json.loads(records))
+    content = to_excel_bytes(df, sheet_name=sheet_name)
+    return Response(
+        content=content,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
     )
 
-# ------------------------------------------- Step 2: GroupBy per settlement -
-settlement_level = (
-    df.groupby([lga_col, ward_col, settlement_col], as_index=False)
-    .agg(**{
-        "Sum(Visited_flag)": ("Visited_flag", "sum"),
-        "Count(Visited_flag)": ("Visited_flag", "count"),
-        "Sum(Points)": (points_col, "sum"),
-    })
-)
 
-# ------------------------------------------ Step 3: % of Visitation --------
-settlement_level["% of Visitation"] = (
-    settlement_level["Sum(Visited_flag)"] / settlement_level["Count(Visited_flag)"] * 100
-).round(2)
+INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Settlement Coverage Analysis</title>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #9aa8bc;
+      --accent: #ff4b4b;
+      --success: #21c354;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", system-ui, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.5;
+    }
+    .layout {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      min-height: 100vh;
+    }
+    aside {
+      background: var(--panel);
+      border-right: 1px solid var(--border);
+      padding: 1.25rem;
+    }
+    main { padding: 1.5rem 2rem; max-width: 1400px; }
+    h1 { margin: 0 0 0.25rem; font-size: 1.75rem; }
+    .caption { color: var(--muted); margin-bottom: 1.5rem; }
+    label { display: block; font-size: 0.85rem; color: var(--muted); margin: 0.75rem 0 0.35rem; }
+    select, input[type="text"], input[type="file"] {
+      width: 100%;
+      padding: 0.5rem 0.65rem;
+      border-radius: 8px;
+      border: 1px solid var(--border);
+      background: #111822;
+      color: var(--text);
+    }
+    button {
+      cursor: pointer;
+      border: none;
+      border-radius: 8px;
+      padding: 0.6rem 1rem;
+      background: var(--accent);
+      color: white;
+      font-weight: 600;
+    }
+    button.secondary { background: #334155; }
+    .card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 1rem;
+      margin-bottom: 1rem;
+    }
+    .kpis {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 1rem;
+      margin: 1rem 0 1.5rem;
+    }
+    .kpi .value { font-size: 1.5rem; font-weight: 700; }
+    .kpi .label { color: var(--muted); font-size: 0.85rem; }
+    .tabs { display: flex; gap: 0.5rem; margin-bottom: 1rem; flex-wrap: wrap; }
+    .tab {
+      background: #243044;
+      color: var(--text);
+      border: 1px solid var(--border);
+    }
+    .tab.active { background: var(--accent); border-color: var(--accent); }
+    .hidden { display: none; }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.85rem;
+    }
+    th, td {
+      border-bottom: 1px solid var(--border);
+      padding: 0.45rem 0.6rem;
+      text-align: left;
+    }
+    th { color: var(--muted); position: sticky; top: 0; background: var(--panel); }
+    .table-wrap { max-height: 420px; overflow: auto; }
+    .alert {
+      background: #3d2a00;
+      border: 1px solid #a16207;
+      color: #fde68a;
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      margin-bottom: 1rem;
+    }
+    .success {
+      background: #052e16;
+      border: 1px solid #166534;
+      color: #86efac;
+    }
+    .toolbar { display: flex; gap: 0.75rem; align-items: center; flex-wrap: wrap; margin-bottom: 1rem; }
+    canvas { max-height: 360px; }
+    @media (max-width: 900px) {
+      .layout { grid-template-columns: 1fr; }
+      .kpis { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <aside>
+      <h2 style="margin-top:0;font-size:1.1rem;">Column mapping</h2>
+      <p style="color:var(--muted);font-size:0.85rem;">Match your CSV columns to the analysis fields.</p>
+      <label for="lga_col">LGA column</label>
+      <select id="lga_col" disabled></select>
+      <label for="ward_col">Ward column</label>
+      <select id="ward_col" disabled></select>
+      <label for="settlement_col">Settlement column</label>
+      <select id="settlement_col" disabled></select>
+      <label for="visitation_col">Visitation status column</label>
+      <select id="visitation_col" disabled></select>
+      <label for="points_col">Points / building count column</label>
+      <select id="points_col" disabled></select>
+      <label for="visited_label">Value meaning &quot;Visited&quot;</label>
+      <input id="visited_label" type="text" value="Visited" />
+      <label for="not_visited_label">Value meaning &quot;Not Visited&quot;</label>
+      <input id="not_visited_label" type="text" value="Not Visited" />
+      <div style="margin-top:1rem;">
+        <button id="analyzeBtn" disabled>Run analysis</button>
+      </div>
+    </aside>
 
-# ------------------------------------------ Step 4: Coverage classification-
-settlement_level["Coverage"] = settlement_level["% of Visitation"].apply(classify_coverage)
-settlement_level["Coverage"] = pd.Categorical(
-    settlement_level["Coverage"], categories=COVERAGE_ORDER, ordered=True
-)
+    <main>
+      <h1>Settlement Coverage Analysis</h1>
+      <p class="caption">Python rebuild of the KNIME workflow <strong>Coverage_Analysis_v2.1</strong> — deployed on Vercel</p>
 
-# ---------------------------------------------------------- Results: KPIs --
-st.header("Results")
-k1, k2, k3, k4 = st.columns(4)
-k1.metric("Settlements analyzed", f"{len(settlement_level):,}")
-k2.metric("Fully Covered", f"{(settlement_level['Coverage'] == 'Fully Covered').sum():,}")
-k3.metric("Not Visited", f"{(settlement_level['Coverage'] == 'Not Visited').sum():,}")
-k4.metric(
-    "Overall % Visitation",
-    f"{settlement_level['Sum(Visited_flag)'].sum() / settlement_level['Count(Visited_flag)'].sum() * 100:.1f}%",
-)
+      <div class="card">
+        <label for="csvFile">Upload the settlement visitation CSV (QGIS export)</label>
+        <input id="csvFile" type="file" accept=".csv" />
+        <p id="uploadHint" style="color:var(--muted);margin:0.75rem 0 0;">Upload a CSV to get started.</p>
+      </div>
 
-# ---------------------------------------------------- Tab 1: Settlement lvl-
-tab1, tab2, tab3 = st.tabs(
-    ["📋 Settlement-level (raw output)", "📊 Coverage by LGA (pivot)", "🚩 Follow-up list"]
-)
+      <div id="messages"></div>
 
-with tab1:
-    st.subheader("Settlement-level Coverage")
-    st.dataframe(settlement_level, width="stretch")
-    st.download_button(
-        "⬇️ Download Settlement-level Excel",
-        data=to_excel_bytes(settlement_level, "Settlement_Level"),
-        file_name="Settlement_level_RAW.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+      <details class="card">
+        <summary>Preview raw data</summary>
+        <div class="table-wrap" id="previewTable"></div>
+      </details>
 
-# --------------------------------------------------- Step 5: Pivot by LGA --
-with tab2:
-    pivot = (
-        settlement_level.groupby([lga_col, "Coverage"], observed=False)[settlement_col]
-        .count()
-        .unstack(fill_value=0)
-        .reindex(columns=COVERAGE_ORDER, fill_value=0)
-    )
-    pivot["Total"] = pivot.sum(axis=1)
-    pivot = pivot.reset_index().rename(columns={lga_col: "LGA"})
+      <section id="results" class="hidden">
+        <h2>Results</h2>
+        <div class="kpis">
+          <div class="card kpi"><div class="value" id="kpiSettlements">0</div><div class="label">Settlements analyzed</div></div>
+          <div class="card kpi"><div class="value" id="kpiFully">0</div><div class="label">Fully Covered</div></div>
+          <div class="card kpi"><div class="value" id="kpiNotVisited">0</div><div class="label">Not Visited</div></div>
+          <div class="card kpi"><div class="value" id="kpiOverall">0%</div><div class="label">Overall % Visitation</div></div>
+        </div>
 
-    st.subheader("Coverage by LGA")
-    st.dataframe(pivot, width="stretch")
+        <div class="tabs">
+          <button class="tab active" data-tab="tab1">Settlement-level</button>
+          <button class="tab" data-tab="tab2">Coverage by LGA</button>
+          <button class="tab" data-tab="tab3">Follow-up list</button>
+        </div>
 
-    chart_df = pivot.set_index("LGA")[COVERAGE_ORDER]
-    st.bar_chart(chart_df, color=[COVERAGE_COLORS[c] for c in COVERAGE_ORDER])
+        <div id="tab1" class="panel card">
+          <div class="toolbar">
+            <h3 style="margin:0;">Settlement-level Coverage</h3>
+            <button class="secondary" data-download="settlement">Download Excel</button>
+          </div>
+          <div class="table-wrap" id="tableSettlement"></div>
+        </div>
 
-    st.download_button(
-        "⬇️ Download LGA-level Excel",
-        data=to_excel_bytes(pivot, "LGA_Level_Coverage"),
-        file_name="LGA_Level_Coverage.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+        <div id="tab2" class="panel card hidden">
+          <div class="toolbar">
+            <h3 style="margin:0;">Coverage by LGA</h3>
+            <button class="secondary" data-download="pivot">Download Excel</button>
+          </div>
+          <div class="table-wrap" id="tablePivot"></div>
+          <canvas id="lgaChart"></canvas>
+        </div>
 
-# ------------------------------------------------- Step 6: Follow-up list --
-with tab3:
-    followup = settlement_level[
-        settlement_level["Coverage"].isin(["Not Visited", "Low Coverage"])
-    ].sort_values([lga_col, "% of Visitation"])
+        <div id="tab3" class="panel card hidden">
+          <div class="toolbar">
+            <h3 style="margin:0;">Settlements needing follow-up</h3>
+            <button class="secondary" data-download="followup">Download Excel</button>
+          </div>
+          <div class="table-wrap" id="tableFollowup"></div>
+        </div>
+      </section>
+    </main>
+  </div>
 
-    st.subheader("Settlements needing follow-up (Not Visited / Low Coverage)")
-    st.dataframe(followup, width="stretch")
-    st.download_button(
-        "⬇️ Download Follow-up List Excel",
-        data=to_excel_bytes(followup, "Missed_LowCovered"),
-        file_name="Missed_Low_covered_Settlements.xlsx",
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    )
+  <script>
+    let analysisData = null;
+    let chartInstance = null;
+
+    const fileInput = document.getElementById("csvFile");
+    const analyzeBtn = document.getElementById("analyzeBtn");
+    const messages = document.getElementById("messages");
+    const selectIds = ["lga_col", "ward_col", "settlement_col", "visitation_col", "points_col"];
+
+    function showMessage(text, type = "alert") {
+      messages.innerHTML = `<div class="${type}">${text}</div>`;
+    }
+
+    function fillSelect(id, columns, selected) {
+      const el = document.getElementById(id);
+      el.innerHTML = columns.map(c => `<option value="${c}" ${c === selected ? "selected" : ""}>${c}</option>`).join("");
+      el.disabled = false;
+    }
+
+    function renderTable(containerId, records) {
+      const container = document.getElementById(containerId);
+      if (!records.length) {
+        container.innerHTML = "<p>No rows.</p>";
+        return;
+      }
+      const cols = Object.keys(records[0]);
+      const head = cols.map(c => `<th>${c}</th>`).join("");
+      const body = records.map(row =>
+        `<tr>${cols.map(c => `<td>${row[c] ?? ""}</td>`).join("")}</tr>`
+      ).join("");
+      container.innerHTML = `<table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`;
+    }
+
+    fileInput.addEventListener("change", async () => {
+      analysisData = null;
+      document.getElementById("results").classList.add("hidden");
+      messages.innerHTML = "";
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const form = new FormData();
+      form.append("file", file);
+
+      analyzeBtn.disabled = true;
+      analyzeBtn.textContent = "Loading preview...";
+
+      try {
+        const res = await fetch("/api/preview", { method: "POST", body: form });
+        if (!res.ok) throw new Error(await res.text());
+        const data = await res.json();
+
+        selectIds.forEach(id => fillSelect(id, data.columns, data.defaults[id]));
+        renderTable("previewTable", data.preview);
+        showMessage(`Loaded ${data.row_count.toLocaleString()} rows and ${data.column_count} columns.`, "success");
+        document.getElementById("uploadHint").textContent = file.name;
+        analyzeBtn.disabled = false;
+        analyzeBtn.textContent = "Run analysis";
+      } catch (err) {
+        showMessage(`Preview failed: ${err.message}`);
+        analyzeBtn.textContent = "Run analysis";
+      }
+    });
+
+    analyzeBtn.addEventListener("click", async () => {
+      const file = fileInput.files[0];
+      if (!file) return;
+
+      const form = new FormData();
+      form.append("file", file);
+      selectIds.forEach(id => form.append(id, document.getElementById(id).value));
+      form.append("visited_label", document.getElementById("visited_label").value);
+      form.append("not_visited_label", document.getElementById("not_visited_label").value);
+
+      analyzeBtn.disabled = true;
+      analyzeBtn.textContent = "Analyzing...";
+
+      try {
+        const res = await fetch("/api/analyze", { method: "POST", body: form });
+        if (!res.ok) throw new Error(await res.text());
+        analysisData = await res.json();
+
+        messages.innerHTML = analysisData.warnings.map(w => `<div class="alert">${w}</div>`).join("");
+
+        document.getElementById("kpiSettlements").textContent = analysisData.kpis.settlements.toLocaleString();
+        document.getElementById("kpiFully").textContent = analysisData.kpis.fully_covered.toLocaleString();
+        document.getElementById("kpiNotVisited").textContent = analysisData.kpis.not_visited.toLocaleString();
+        document.getElementById("kpiOverall").textContent = `${analysisData.kpis.overall_pct}%`;
+
+        renderTable("tableSettlement", analysisData.settlement_level);
+        renderTable("tablePivot", analysisData.pivot);
+        renderTable("tableFollowup", analysisData.followup);
+
+        if (chartInstance) chartInstance.destroy();
+        chartInstance = new Chart(document.getElementById("lgaChart"), {
+          type: "bar",
+          data: {
+            labels: analysisData.chart.labels,
+            datasets: analysisData.chart.datasets
+          },
+          options: {
+            responsive: true,
+            plugins: { legend: { labels: { color: "#e7ecf3" } } },
+            scales: {
+              x: { stacked: true, ticks: { color: "#9aa8bc" }, grid: { color: "#2d3a4f" } },
+              y: { stacked: true, ticks: { color: "#9aa8bc" }, grid: { color: "#2d3a4f" } }
+            }
+          }
+        });
+
+        document.getElementById("results").classList.remove("hidden");
+      } catch (err) {
+        showMessage(`Analysis failed: ${err.message}`);
+      } finally {
+        analyzeBtn.disabled = false;
+        analyzeBtn.textContent = "Run analysis";
+      }
+    });
+
+    document.querySelectorAll(".tab").forEach(btn => {
+      btn.addEventListener("click", () => {
+        document.querySelectorAll(".tab").forEach(b => b.classList.remove("active"));
+        document.querySelectorAll(".panel").forEach(p => p.classList.add("hidden"));
+        btn.classList.add("active");
+        document.getElementById(btn.dataset.tab).classList.remove("hidden");
+      });
+    });
+
+    document.querySelectorAll("[data-download]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        if (!analysisData) return;
+        const key = btn.dataset.download;
+        const map = {
+          settlement: { records: analysisData.settlement_level, sheet: "Settlement_Level", file: "Settlement_level_RAW.xlsx" },
+          pivot: { records: analysisData.pivot, sheet: "LGA_Level_Coverage", file: "LGA_Level_Coverage.xlsx" },
+          followup: { records: analysisData.followup, sheet: "Missed_LowCovered", file: "Missed_Low_covered_Settlements.xlsx" }
+        };
+        const cfg = map[key];
+        const form = new FormData();
+        form.append("records", JSON.stringify(cfg.records));
+        form.append("sheet_name", cfg.sheet);
+        form.append("file_name", cfg.file);
+
+        const res = await fetch("/api/download", { method: "POST", body: form });
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = url;
+        a.download = cfg.file;
+        a.click();
+        URL.revokeObjectURL(url);
+      });
+    });
+  </script>
+</body>
+</html>
+"""
