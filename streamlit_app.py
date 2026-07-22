@@ -1,4 +1,7 @@
-"""Local Streamlit version — run with: streamlit run streamlit_app.py"""
+"""Settlement Coverage Analysis — Streamlit Application
+
+Run with: streamlit run streamlit_app.py
+"""
 
 import pandas as pd
 import streamlit as st

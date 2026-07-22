@@ -3,8 +3,9 @@
 A Python/Streamlit rebuild of your KNIME workflow `Coverage_Analysis_v2.1`.
 
 ## What's in this folder
-- `app.py` — the Streamlit app
-- `requirements.txt` — the Python libraries it needs
+- `streamlit_app.py` — the main Streamlit application
+- `analysis.py` — shared analysis logic
+- `requirements.txt` — the Python libraries needed
 
 ## 1. Folder to save these files in
 Create one project folder on your Desktop and keep both files together, e.g.:
@@ -61,7 +62,7 @@ This installs:
 Still inside the activated virtual environment:
 
 ```bash
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 Your browser will open automatically to something like `http://localhost:8501`.
@@ -83,7 +84,7 @@ You only need steps 3 (activate) and 5 (run) again — no need to reinstall anyt
 ```bash
 cd Desktop/Coverage-Analysis-App
 venv\Scripts\activate      # or source venv/bin/activate on Mac
-streamlit run app.py
+streamlit run streamlit_app.py
 ```
 
 ## A note on the original KNIME file
