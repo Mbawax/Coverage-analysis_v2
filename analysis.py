@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import io
+import json
 from typing import Any
 
 import numpy as np
@@ -48,7 +49,7 @@ def df_to_records(df: pd.DataFrame) -> list[dict[str, Any]]:
     for col in out.columns:
         if pd.api.types.is_categorical_dtype(out[col]):
             out[col] = out[col].astype(str)
-    return out.where(pd.notna(out), None).to_dict(orient="records")
+    return json.loads(out.to_json(orient="records"))
 
 
 def run_analysis(

@@ -1,10 +1,46 @@
-from fastapi import FastAPI, File, Form, UploadFile
+import io
+import json
+
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import HTMLResponse, Response
 import pandas as pd
 
 from analysis import guess_column, run_analysis, to_excel_bytes
 
 app = FastAPI(title="Settlement Coverage Analysis")
+
+FAVICON_SVG = (
+    '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">'
+    '<rect width="32" height="32" rx="6" fill="#ff4b4b"/>'
+    '<path d="M16 6l8 18h-4l-1.5-4h-5L12 24H8L16 6zm0 8.5L14.2 18h3.6L16 14.5z" fill="#fff"/>'
+    "</svg>"
+)
+
+
+async def read_csv_upload(file: UploadFile) -> pd.DataFrame:
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded.")
+
+    content = await file.read()
+    if not content:
+        raise HTTPException(status_code=400, detail="Uploaded file is empty.")
+
+    try:
+        return pd.read_csv(io.BytesIO(content))
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Could not read CSV: {exc}"
+        ) from exc
+
+
+def records_json_safe(df: pd.DataFrame, limit: int | None = None) -> list[dict]:
+    subset = df.head(limit) if limit is not None else df
+    return json.loads(subset.to_json(orient="records"))
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> Response:
+    return Response(content=FAVICON_SVG, media_type="image/svg+xml")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -14,11 +50,11 @@ def home() -> str:
 
 @app.post("/api/preview")
 async def preview(file: UploadFile = File(...)) -> dict:
-    raw_df = pd.read_csv(file.file)
+    raw_df = await read_csv_upload(file)
     columns = raw_df.columns.tolist()
     return {
-        "row_count": len(raw_df),
-        "column_count": len(raw_df.columns),
+        "row_count": int(len(raw_df)),
+        "column_count": int(len(raw_df.columns)),
         "columns": columns,
         "defaults": {
             "lga_col": guess_column(columns, ["lga_name", "grid_lga", "LGA"]),
@@ -29,9 +65,7 @@ async def preview(file: UploadFile = File(...)) -> dict:
             "visitation_col": guess_column(columns, ["visitation", "visit_status"]),
             "points_col": guess_column(columns, ["NUMPOINTS", "building_count"]),
         },
-        "preview": raw_df.head(50).where(pd.notna(raw_df.head(50)), None).to_dict(
-            orient="records"
-        ),
+        "preview": records_json_safe(raw_df, limit=50),
     }
 
 
@@ -46,17 +80,26 @@ async def analyze(
     visited_label: str = Form("Visited"),
     not_visited_label: str = Form("Not Visited"),
 ) -> dict:
-    raw_df = pd.read_csv(file.file)
-    return run_analysis(
-        raw_df,
-        lga_col=lga_col,
-        ward_col=ward_col,
-        settlement_col=settlement_col,
-        visitation_col=visitation_col,
-        points_col=points_col,
-        visited_label=visited_label,
-        not_visited_label=not_visited_label,
-    )
+    raw_df = await read_csv_upload(file)
+    try:
+        return run_analysis(
+            raw_df,
+            lga_col=lga_col,
+            ward_col=ward_col,
+            settlement_col=settlement_col,
+            visitation_col=visitation_col,
+            points_col=points_col,
+            visited_label=visited_label,
+            not_visited_label=not_visited_label,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Column not found in CSV: {exc}"
+        ) from exc
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Analysis failed: {exc}"
+        ) from exc
 
 
 @app.post("/api/download")
@@ -65,10 +108,14 @@ async def download(
     sheet_name: str = Form("Sheet1"),
     file_name: str = Form("export.xlsx"),
 ) -> Response:
-    import json
+    try:
+        df = pd.DataFrame(json.loads(records))
+        content = to_excel_bytes(df, sheet_name=sheet_name)
+    except Exception as exc:
+        raise HTTPException(
+            status_code=400, detail=f"Download failed: {exc}"
+        ) from exc
 
-    df = pd.DataFrame(json.loads(records))
-    content = to_excel_bytes(df, sheet_name=sheet_name)
     return Response(
         content=content,
         media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -82,6 +129,7 @@ INDEX_HTML = """<!DOCTYPE html>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Settlement Coverage Analysis</title>
+  <link rel="icon" href="/favicon.ico" type="image/svg+xml" />
   <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
   <style>
     :root {
@@ -282,6 +330,20 @@ INDEX_HTML = """<!DOCTYPE html>
     const messages = document.getElementById("messages");
     const selectIds = ["lga_col", "ward_col", "settlement_col", "visitation_col", "points_col"];
 
+    const API = "";
+
+    async function readError(res) {
+      const text = await res.text();
+      try {
+        const payload = JSON.parse(text);
+        if (typeof payload.detail === "string") return payload.detail;
+        if (Array.isArray(payload.detail)) {
+          return payload.detail.map(d => d.msg || String(d)).join("; ");
+        }
+      } catch (_) {}
+      return text.slice(0, 500) || `Request failed (${res.status})`;
+    }
+
     function showMessage(text, type = "alert") {
       messages.innerHTML = `<div class="${type}">${text}</div>`;
     }
@@ -320,8 +382,8 @@ INDEX_HTML = """<!DOCTYPE html>
       analyzeBtn.textContent = "Loading preview...";
 
       try {
-        const res = await fetch("/api/preview", { method: "POST", body: form });
-        if (!res.ok) throw new Error(await res.text());
+        const res = await fetch(`${API}/api/preview`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await readError(res));
         const data = await res.json();
 
         selectIds.forEach(id => fillSelect(id, data.columns, data.defaults[id]));
@@ -332,6 +394,8 @@ INDEX_HTML = """<!DOCTYPE html>
         analyzeBtn.textContent = "Run analysis";
       } catch (err) {
         showMessage(`Preview failed: ${err.message}`);
+      } finally {
+        analyzeBtn.disabled = false;
         analyzeBtn.textContent = "Run analysis";
       }
     });
@@ -350,8 +414,8 @@ INDEX_HTML = """<!DOCTYPE html>
       analyzeBtn.textContent = "Analyzing...";
 
       try {
-        const res = await fetch("/api/analyze", { method: "POST", body: form });
-        if (!res.ok) throw new Error(await res.text());
+        const res = await fetch(`${API}/api/analyze`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await readError(res));
         analysisData = await res.json();
 
         messages.innerHTML = analysisData.warnings.map(w => `<div class="alert">${w}</div>`).join("");
@@ -415,7 +479,8 @@ INDEX_HTML = """<!DOCTYPE html>
         form.append("sheet_name", cfg.sheet);
         form.append("file_name", cfg.file);
 
-        const res = await fetch("/api/download", { method: "POST", body: form });
+        const res = await fetch(`${API}/api/download`, { method: "POST", body: form });
+        if (!res.ok) throw new Error(await readError(res));
         const blob = await res.blob();
         const url = URL.createObjectURL(blob);
         const a = document.createElement("a");
